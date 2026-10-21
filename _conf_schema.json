@@ -1,0 +1,127 @@
+{
+  "connection": {
+    "description": "OpenList 连接",
+    "type": "object",
+    "hint": "服务地址与认证信息，需要你在 OpenList 后台自行获取/确认。",
+    "items": {
+      "base_url": {
+        "description": "OpenList 服务地址",
+        "type": "string",
+        "default": "",
+        "hint": "例如 https://openlist.example.com；不要带 /api 后缀。"
+      },
+      "auth_mode": {
+        "description": "认证方式",
+        "type": "string",
+        "default": "password",
+        "options": ["password", "token"],
+        "hint": "password = 用户名 + 密码登录；token = OpenList 后台「设置 - 其他 - 令牌」里生成的访问密钥。"
+      },
+      "username": {
+        "description": "用户名",
+        "type": "string",
+        "default": "",
+        "hint": "认证方式为 password 时填写。"
+      },
+      "password": {
+        "description": "密码",
+        "type": "string",
+        "default": "",
+        "hint": "认证方式为 password 时填写。"
+      },
+      "access_token": {
+        "description": "访问密钥",
+        "type": "string",
+        "default": "",
+        "hint": "认证方式为 token 时填写。形如 openlist-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx。"
+      },
+      "verify_tls": {
+        "description": "校验 HTTPS 证书",
+        "type": "bool",
+        "default": true,
+        "hint": "自签证书的内网 OpenList 可以关闭。"
+      },
+      "timeout": {
+        "description": "请求超时（秒）",
+        "type": "int",
+        "default": 30,
+        "slider": { "min": 5, "max": 300, "step": 5 }
+      }
+    }
+  },
+  "download": {
+    "description": "离线下载",
+    "type": "object",
+    "hint": "下载目标路径与离线下载方式。路径必须是 OpenList 里真实存在的目录。",
+    "items": {
+      "download_path": {
+        "description": "离线下载保存路径",
+        "type": "string",
+        "default": "/",
+        "hint": "所有离线下载任务都保存到这里，例如 /115/临时 或 /115/离线下载。"
+      },
+      "download_tool": {
+        "description": "离线下载方式",
+        "type": "string",
+        "default": "",
+        "hint": "留空则由插件自动选择该路径可用的第一个方式（如 115 Open / SimpleHttp / aria2 / qBittorrent）；也可以直接填写方式名称固定下来。"
+      },
+      "delete_policy": {
+        "description": "临时文件清理策略",
+        "type": "string",
+        "default": "delete_on_upload_succeed",
+        "options": [
+          "delete_on_upload_succeed",
+          "delete_on_upload_failed",
+          "delete_never",
+          "delete_always",
+          "upload_download_stream"
+        ],
+        "hint": "仅对需要下载到本地再上传的离线下载方式生效。"
+      },
+      "max_urls": {
+        "description": "单次最多提交链接数",
+        "type": "int",
+        "default": 10,
+        "slider": { "min": 1, "max": 50, "step": 1 }
+      }
+    }
+  },
+  "notify": {
+    "description": "任务完成推送",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用完成推送",
+        "type": "bool",
+        "default": true,
+        "hint": "任务完成或失败后主动推送到提交任务的会话。"
+      },
+      "interval": {
+        "description": "轮询间隔（秒）",
+        "type": "int",
+        "default": 30,
+        "slider": { "min": 5, "max": 600, "step": 5 }
+      },
+      "expire_hours": {
+        "description": "放弃跟踪时长（小时）",
+        "type": "int",
+        "default": 24,
+        "slider": { "min": 1, "max": 168, "step": 1 },
+        "hint": "超过这个时间仍未结束的任务不再跟踪（避免长期轮询）。"
+      }
+    }
+  },
+  "advanced": {
+    "description": "高级",
+    "type": "object",
+    "items": {
+      "admin_only": {
+        "description": "仅管理员可用",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后只有 AstrBot 管理员能提交/取消离线下载任务。"
+      }
+    }
+  }
+}
