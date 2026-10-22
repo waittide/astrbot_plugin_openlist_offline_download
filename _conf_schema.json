@@ -120,7 +120,13 @@
         "description": "仅管理员可用",
         "type": "bool",
         "default": true,
-        "hint": "开启后只有 AstrBot 管理员能提交/取消离线下载任务。"
+        "hint": "开启后只有 AstrBot 管理员能提交离线下载任务、修改 OpenList 上的文件。"
+      },
+      "confirm_destructive": {
+        "description": "文件操作二次确认",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，AI 执行删除/移动/重命名（覆盖）时先返回清单等待确认，不会直接动手。"
       }
     }
   }

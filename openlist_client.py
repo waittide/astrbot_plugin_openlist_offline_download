@@ -40,6 +40,15 @@ DELETE_POLICIES = (
     "upload_download_stream",
 )
 
+# 需要跟踪/查询的任务类别（server/handles/task.go SetupTaskRoute）
+TASK_KINDS = {
+    "offline_download": "离线下载",
+    "move": "移动",
+    "copy": "复制",
+    "upload": "上传",
+    "decompress": "解压",
+}
+
 
 class OpenListError(Exception):
     """OpenList 调用异常基类。"""
@@ -171,23 +180,36 @@ class OpenListClient:
                 headers=headers,
             ) as resp:
                 text = await resp.text()
-                if resp.status in (401, 403):
-                    raise OpenListAuthError(
-                        f"OpenList 认证失败（HTTP {resp.status}），请检查访问密钥或用户名密码",
-                    )
                 try:
                     body = await _loads(text)
                 except ValueError:
+                    if resp.status in (401, 403):
+                        raise OpenListAuthError(
+                            f"OpenList 认证失败（HTTP {resp.status}），"
+                            "请检查访问密钥或用户名密码",
+                        ) from None
                     raise OpenListAPIError(
                         f"OpenList 返回了非 JSON 响应（HTTP {resp.status}）：{text[:200]}",
                     ) from None
+                if not isinstance(body, dict):
+                    body = {}
+                code = body.get("code")
+                # 真正的认证失败：OpenList 既可能回 HTTP 401，也可能回 HTTP 200
+                # 但业务码 401（token is invalidated）。403 是权限/文件已存在等
+                # 业务拒绝，不能当成认证失败去重登。
+                if resp.status == 401 or code == 401:
+                    raise OpenListAuthError(
+                        str(body.get("message")
+                            or f"OpenList 认证失败（HTTP {resp.status}）"
+                            )
+                        + "（请检查访问密钥或用户名密码）"
+                    )
                 if resp.status >= 400:
                     raise OpenListAPIError(
                         f"OpenList 请求失败（HTTP {resp.status}）："
                         f"{body.get('message') or text[:200]}",
-                        body.get("code"),
+                        code if isinstance(code, int) else None,
                     )
-                code = body.get("code")
                 if code not in (None, 200):
                     raise OpenListAPIError(
                         str(body.get("message") or "未知错误"),
@@ -243,8 +265,10 @@ class OpenListClient:
     async def me(self) -> dict[str, Any]:
         return await self.request("GET", "/me") or {}
 
-    async def list_dir(self, path: str = "/", page: int = 1, per_page: int = 100) -> list[dict[str, Any]]:
-        """列出目录内容。"""
+    async def list_dir(
+        self, path: str = "/", page: int = 1, per_page: int = 100, refresh: bool = False
+    ) -> dict[str, Any]:
+        """列出目录内容，返回 {content, total, write, provider}。"""
         path = (path or "/").strip() or "/"
         data = await self.request(
             "POST",
@@ -253,14 +277,110 @@ class OpenListClient:
                 "path": path,
                 "page": max(1, int(page or 1)),
                 "per_page": max(1, int(per_page or 100)),
-                "refresh": False,
+                "refresh": bool(refresh),
                 "password": "",
             },
         )
-        content = (data or {}).get("content") if isinstance(data, dict) else None
-        if not isinstance(content, list):
+        if not isinstance(data, dict):
+            return {"content": [], "total": 0}
+        content = data.get("content")
+        data["content"] = (
+            [item for item in content if isinstance(item, dict)]
+            if isinstance(content, list)
+            else []
+        )
+        return data
+
+    async def list_dirs(self, path: str = "/") -> list[dict[str, Any]]:
+        """只列出子目录（/fs/dirs），返回 [{name, modified}]。"""
+        data = await self.request(
+            "GET", "/fs/dirs", params={"path": (path or "/").strip() or "/"}
+        )
+        if not isinstance(data, list):
             return []
-        return [item for item in content if isinstance(item, dict)]
+        return [item for item in data if isinstance(item, dict)]
+
+    async def stat(self, path: str) -> dict[str, Any] | None:
+        """查询单个路径的信息；不存在时返回 None。"""
+        try:
+            data = await self.request(
+                "GET", "/fs/get", params={"path": (path or "/").strip() or "/"}
+            )
+        except OpenListAPIError as exc:
+            message = str(exc).lower()
+            if "not found" in message or "不存在" in message:
+                return None
+            raise
+        return data if isinstance(data, dict) else None
+
+    async def mkdir(self, path: str) -> None:
+        await self.request("POST", "/fs/mkdir", json_body={"path": path})
+
+    async def rename(
+        self, path: str, name: str, *, overwrite: bool = False
+    ) -> None:
+        """重命名：path 是旧完整路径，name 是新名字（不能带路径分隔符）。"""
+        await self.request(
+            "POST",
+            "/fs/rename",
+            json_body={"path": path, "name": name, "overwrite": bool(overwrite)},
+        )
+
+    async def move(
+        self,
+        src_dir: str,
+        dst_dir: str,
+        names: list[str],
+        *,
+        overwrite: bool = False,
+        skip_existing: bool = False,
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        """批量移动。names 是 src_dir 下的名字；跨存储时返回异步任务。"""
+        data = await self.request(
+            "POST",
+            "/fs/move",
+            json_body={
+                "src_dir": src_dir,
+                "dst_dir": dst_dir,
+                "names": names,
+                "overwrite": bool(overwrite),
+                "skip_existing": bool(skip_existing),
+                "merge": bool(merge),
+            },
+        )
+        return data if isinstance(data, dict) else {}
+
+    async def copy(
+        self,
+        src_dir: str,
+        dst_dir: str,
+        names: list[str],
+        *,
+        overwrite: bool = False,
+        skip_existing: bool = False,
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        """批量复制。names 是 src_dir 下的名字；跨存储时返回异步任务。"""
+        data = await self.request(
+            "POST",
+            "/fs/copy",
+            json_body={
+                "src_dir": src_dir,
+                "dst_dir": dst_dir,
+                "names": names,
+                "overwrite": bool(overwrite),
+                "skip_existing": bool(skip_existing),
+                "merge": bool(merge),
+            },
+        )
+        return data if isinstance(data, dict) else {}
+
+    async def remove(self, dir_path: str, names: list[str]) -> None:
+        """批量删除。dir_path 是所在目录，names 是目录内的名字。"""
+        await self.request(
+            "POST", "/fs/remove", json_body={"dir": dir_path, "names": names}
+        )
 
     async def storages(self) -> list[dict[str, Any]]:
         """列出全部存储挂载（需要管理员权限）。"""
@@ -302,30 +422,38 @@ class OpenListClient:
             return []
         return [t for t in tasks if isinstance(t, dict)]
 
-    async def list_tasks(self, which: str = "undone") -> list[dict[str, Any]]:
+    async def list_tasks(
+        self, which: str = "undone", kind: str = "offline_download"
+    ) -> list[dict[str, Any]]:
         if which not in ("undone", "done"):
             raise OpenListConfigError(f"未知的任务列表类型：{which}")
-        data = await self.request("GET", f"/task/offline_download/{which}")
+        if kind not in TASK_KINDS:
+            raise OpenListConfigError(f"未知的任务类别：{kind}")
+        data = await self.request("GET", f"/task/{kind}/{which}")
         if not isinstance(data, list):
             return []
         return [t for t in data if isinstance(t, dict)]
 
-    async def task_info(self, task_id: str) -> dict[str, Any]:
+    async def task_info(
+        self, task_id: str, kind: str = "offline_download"
+    ) -> dict[str, Any]:
         data = await self.request(
-            "POST", "/task/offline_download/info", params={"tid": task_id}
+            "POST", f"/task/{kind}/info", params={"tid": task_id}
         )
         return data if isinstance(data, dict) else {}
 
-    async def task_action(self, action: str, task_id: str = "") -> None:
+    async def task_action(
+        self, action: str, task_id: str = "", kind: str = "offline_download"
+    ) -> None:
         if action == "clear_done":
-            await self.request("POST", "/task/offline_download/clear_done")
+            await self.request("POST", f"/task/{kind}/clear_done")
             return
         if action not in ("cancel", "retry", "delete"):
             raise OpenListConfigError(f"未知的任务操作：{action}")
         if not task_id:
             raise OpenListConfigError("该操作需要提供 task_id")
         await self.request(
-            "POST", f"/task/offline_download/{action}", params={"tid": task_id}
+            "POST", f"/task/{kind}/{action}", params={"tid": task_id}
         )
 
 

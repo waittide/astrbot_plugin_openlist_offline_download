@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import posixpath
+import shlex
 import time
 from datetime import datetime
 from typing import Any
@@ -24,6 +26,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .openlist_client import (
     DELETE_POLICIES,
     FINAL_TASK_STATES,
+    TASK_KINDS,
     OpenListAPIError,
     OpenListAuthError,
     OpenListClient,
@@ -43,19 +46,33 @@ URL_PREFIXES = (
     "thunder://",
 )
 
-HELP_TEXT = """OpenList 离线下载
+HELP_TEXT = """OpenList 离线下载与文件管理
 
-/ol dl <链接>    把链接交给 OpenList 离线下载（可一次多个，空格分隔）
-/ol tasks        查看进行中的任务
-/ol done         查看已结束的任务
-/ol detail <id>  查看单个任务详情
-/ol cancel <id>  取消任务
-/ol retry <id>   重试任务
-/ol clear        清空已结束的任务记录
-/ol delete <id>  删除单个任务记录
-/ol status       检查 OpenList 连接与配置
+【离线下载】
+/ol dl <链接>      提交离线下载（可一次多个，空格分隔）
+/ol tasks           查看进行中的任务
+/ol done            查看已结束的任务
+/ol detail <id>     查看单个任务详情
+/ol cancel <id>     取消任务
+/ol retry <id>      重试任务
+/ol clear           清空已结束的任务记录
+/ol delete <id>     删除单个任务记录
 
-也可以直接跟我说：把 magnet:?xt=urn:btih:xxx 离线下载"""
+【文件管理】
+/ol ls [路径]                     列出目录（默认根目录）
+/ol mkdir <路径>                  新建目录
+/ol mv <源路径...> <目标目录>     移动
+/ol cp <源路径...> <目标目录>     复制
+/ol rm <路径...>                  删除（目录会连内容一起删）
+/ol rn <路径> <新名字>            重命名
+
+/ol status          检查 OpenList 连接与配置
+
+路径带空格请用引号括起来，例如：
+/ol cp "/115/临时/我的 文件.mkv" /115/整理
+
+也可以直接跟我说：把 magnet:?xt=urn:btih:xxx 离线下载；
+看看 /115/临时 里有什么；把 a.mkv 改名为 b.mkv"""
 
 
 def _human_size(num: Any) -> str:
@@ -121,6 +138,38 @@ def _fmt_task_line(task: dict[str, Any]) -> str:
     return f"· {task.get('name') or task.get('id')}\n  {' | '.join(bits)}\n  id: {task.get('id')}"
 
 
+def _norm_path(raw: Any) -> str:
+    """把用户给的路径规范成以 / 开头的绝对路径。"""
+    text = str(raw or "").strip().strip("`'\"<>")
+    if not text:
+        return ""
+    if not text.startswith("/"):
+        text = "/" + text
+    normalized = posixpath.normpath(text)
+    return normalized if normalized.startswith("/") else "/" + normalized
+
+
+def _fmt_entry(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or "")
+    stamp = _human_time(item.get("modified"))
+    if item.get("is_dir"):
+        return f"📁 {name}/  {stamp}"
+    return f"📄 {name}  {_human_size(item.get('size'))}  {stamp}"
+
+
+def _split_path(raw: Any) -> tuple[str, str]:
+    """把路径拆成 (所在目录, 名字)。"""
+    path = _norm_path(raw)
+    if path in ("", "/"):
+        return "/", ""
+    return posixpath.dirname(path) or "/", posixpath.basename(path)
+
+
+def _is_storage_root(path: str) -> bool:
+    """一级目录在 OpenList 里就是存储挂载点，不允许重命名/删除/移动。"""
+    return path != "/" and path.count("/") == 1
+
+
 def _fmt_task_block(task: dict[str, Any]) -> str:
     lines = [
         f"任务：{task.get('name') or task.get('id')}",
@@ -153,6 +202,7 @@ class OpenListOfflineDownload(Star):
         self._tracked: dict[str, dict[str, Any]] = {}
         self._state_file: str = ""
         self._lock = asyncio.Lock()
+
 
     # ------------------------------------------------------------- lifecycle
     async def initialize(self) -> None:
@@ -230,6 +280,12 @@ class OpenListOfflineDownload(Star):
     def _admin_only(self) -> bool:
         return bool(self._cfg("advanced.admin_only", True))
 
+    def _confirm_destructive(self) -> bool:
+        return bool(self._cfg("advanced.confirm_destructive", True))
+
+    def _needs_confirm(self, dangerous: bool, confirm: Any) -> bool:
+        return bool(dangerous) and self._confirm_destructive() and not bool(confirm)
+
     # ---------------------------------------------------------------- client
     async def _get_client(self) -> OpenListClient:
         cfg = self._connection_cfg()
@@ -303,7 +359,12 @@ class OpenListOfflineDownload(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[openlist] 保存任务跟踪状态失败：{exc}")
 
-    def _track(self, tasks: list[dict[str, Any]], session: str) -> None:
+    def _track(
+        self,
+        tasks: list[dict[str, Any]],
+        session: str,
+        kind: str = "offline_download",
+    ) -> None:
         if not self._notify_enabled() or not session:
             return
         now = time.time()
@@ -316,6 +377,7 @@ class OpenListOfflineDownload(Star):
                 "name": task.get("name") or str(task_id),
                 "created_at": now,
                 "last_state": task.get("state"),
+                "kind": kind,
             }
         self._save_tracked()
 
@@ -346,20 +408,30 @@ class OpenListOfflineDownload(Star):
         if client is None:
             logger.debug(f"[openlist] 轮询跳过：{hint}")
             return
-        pending = await client.list_tasks("undone")
-        done = await client.list_tasks("done")
-        pending_map = {str(t.get("id")): t for t in pending if t.get("id")}
-        done_map = {str(t.get("id")): t for t in done if t.get("id")}
+        kinds = {
+            str(meta.get("kind") or "offline_download")
+            for meta in self._tracked.values()
+        }
+        pending_map: dict[tuple[str, str], dict[str, Any]] = {}
+        done_map: dict[tuple[str, str], dict[str, Any]] = {}
+        for kind in kinds:
+            for task in await client.list_tasks("undone", kind):
+                if task.get("id"):
+                    pending_map[(kind, str(task["id"]))] = task
+            for task in await client.list_tasks("done", kind):
+                if task.get("id"):
+                    done_map[(kind, str(task["id"]))] = task
 
         async with self._lock:
             now = time.time()
             finished: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
             for task_id, meta in list(self._tracked.items()):
-                if task_id in pending_map:
-                    meta["last_state"] = pending_map[task_id].get("state")
+                key = (str(meta.get("kind") or "offline_download"), task_id)
+                if key in pending_map:
+                    meta["last_state"] = pending_map[key].get("state")
                     continue
-                if task_id in done_map:
-                    task = done_map[task_id]
+                if key in done_map:
+                    task = done_map[key]
                     try:
                         state = int(task.get("state"))
                     except (TypeError, ValueError):
@@ -385,18 +457,21 @@ class OpenListOfflineDownload(Star):
         except (TypeError, ValueError):
             state = -1
         name = task.get("name") or meta.get("name") or task.get("id")
+        kind = str(meta.get("kind") or "offline_download")
+        label = TASK_KINDS.get(kind, "任务")
         if state == 2:
             text = (
-                f"✅ OpenList 离线下载完成\n"
+                f"✅ OpenList {label}完成\n"
                 f"任务：{name}\n"
                 f"大小：{_human_size(task.get('total_bytes'))}\n"
-                f"耗时：{_human_duration(task)}\n"
-                f"保存路径：{self._download_path()}"
+                f"耗时：{_human_duration(task)}"
             )
+            if kind == "offline_download":
+                text += f"\n保存路径：{self._download_path()}"
         else:
             reason = str(task.get("error") or task.get("status") or "").strip()
             text = (
-                f"❌ OpenList 离线下载未成功（{describe_state(state)}）\n"
+                f"❌ OpenList {label}未成功（{describe_state(state)}）\n"
                 f"任务：{name}\n"
                 + (f"原因：{reason}\n" if reason else "")
                 + f"id：{task.get('id')}"
@@ -471,6 +546,357 @@ class OpenListOfflineDownload(Star):
         else:
             lines.append("服务端未返回任务信息，请用 /ol tasks 查看进度。")
         return "\n".join(lines)
+
+    # -------------------------------------------------------------- 文件管理
+    async def _list_files(self, path: str) -> str:
+        client, hint = await self._client_or_hint()
+        if client is None:
+            return hint
+        target = _norm_path(path or "/")
+        try:
+            info = await client.stat(target) if target != "/" else None
+        except OpenListError as exc:
+            return f"列出目录失败：{exc}"
+        if info is not None and not info.get("is_dir"):
+            lines = [
+                f"路径：{target}",
+                f"大小：{_human_size(info.get('size'))}",
+                f"修改时间：{_human_time(info.get('modified'))}",
+            ]
+            if info.get("sign") or info.get("raw_url"):
+                lines.append(f"直链：{info.get('sign') or info.get('raw_url')}")
+            return "\n".join(lines)
+        try:
+            data = await client.list_dir(target, per_page=200, refresh=True)
+        except OpenListAPIError as exc:
+            # 无「刷新目录」权限的账号会 403，退回普通列表。
+            if exc.code == 403 or "Refresh" in str(exc):
+                try:
+                    data = await client.list_dir(target, per_page=200)
+                except OpenListError as inner:
+                    return f"列出目录失败：{inner}"
+            else:
+                return f"列出目录失败：{exc}"
+        except OpenListError as exc:
+            return f"列出目录失败：{exc}"
+        content = data.get("content") or []
+        if not content:
+            return f"目录 {target} 是空的。"
+        total = data.get("total") or len(content)
+        header = f"目录：{target}（共 {total} 项"
+        if data.get("write") is not None:
+            header += "，可写" if data.get("write") else "，只读"
+        header += "）"
+        lines = [header]
+        for item in content[:50]:
+            lines.append(_fmt_entry(item))
+        if total > 50:
+            lines.append(f"……仅显示前 50 项，共 {total} 项")
+        return "\n".join(lines)
+
+    def _preview(
+        self, header: str, items: list[str], tip: str = ""
+    ) -> str:
+        lines = [header]
+        lines.extend(f"· {item}" for item in items[:30])
+        if len(items) > 30:
+            lines.append(f"……等共 {len(items)} 项")
+        if tip:
+            lines.append(tip)
+        lines.append(
+            "确认无误后回复我，我再执行；也可以直接用 /ol 指令执行。"
+            "（如需关闭二次确认：插件配置 → 高级 → 文件操作二次确认）"
+        )
+        return "\n".join(lines)
+
+    async def _check_target_dir(self, client: OpenListClient, dst: str) -> str:
+        """确认目标目录存在且确实是目录，返回错误文本或空串。"""
+        if dst == "/":
+            return ""
+        try:
+            info = await client.stat(dst)
+        except OpenListError as exc:
+            return f"检查目标目录失败：{exc}"
+        if info is None:
+            return f"目标目录不存在：{dst}\n可以先新建：/ol mkdir {dst}"
+        if not info.get("is_dir"):
+            return f"目标不是目录：{dst}。如果要改名请用重命名。"
+        return ""
+
+    async def _transfer(
+        self,
+        kind: str,
+        paths: list[str],
+        dst_dir: str,
+        overwrite: Any = False,
+        confirm: Any = False,
+        event: AstrMessageEvent | None = None,
+    ) -> str:
+        """移动 / 复制。kind 为 move 或 copy。"""
+        label = "移动" if kind == "move" else "复制"
+        sources = [_norm_path(p) for p in (paths or []) if str(p or "").strip()]
+        if not sources:
+            return f"需要提供要{label}的文件或目录路径。"
+        if len(sources) > 50:
+            return f"单次最多{label} 50 项。"
+        for src in sources:
+            if src == "/":
+                return "不能操作根目录。"
+            if _is_storage_root(src):
+                return f"{src} 是存储挂载点，不能{label}。"
+        dst = _norm_path(dst_dir)
+        if not dst:
+            return f"需要提供目标目录。"
+
+        client, hint = await self._client_or_hint()
+        if client is None:
+            return hint
+        err = await self._check_target_dir(client, dst)
+        if err:
+            return err
+
+        if self._needs_confirm(kind == "move" or bool(overwrite), confirm):
+            return self._preview(
+                f"将要{label} {len(sources)} 项到 {dst}：",
+                sources,
+                "（移动后原位置的文件会消失，这是不可撤销操作）" if kind == "move" else "",
+            )
+
+        # 按所在目录分组，OpenList 的 move/copy 接口以“源目录 + 名字列表”为单位。
+        groups: dict[str, list[str]] = {}
+        for src in sources:
+            parent, name = _split_path(src)
+            if not name:
+                return f"无法解析路径：{src}"
+            if parent == dst:
+                return f"{src} 已经在 {dst} 里了。"
+            groups.setdefault(parent, []).append(name)
+
+        # 预检同名冲突，给出能看懂的提示（服务端只会回 file [x] exists）。
+        conflicts: list[str] = []
+        if not overwrite:
+            for src in sources:
+                _, name = _split_path(src)
+                target = posixpath.join(dst, name) if dst != "/" else "/" + name
+                try:
+                    if await client.stat(target) is not None:
+                        conflicts.append(target)
+                except OpenListError:
+                    continue
+            if conflicts:
+                return (
+                    f"目标目录里已经有同名的 {len(conflicts)} 项：\n"
+                    + "\n".join(f"· {c}" for c in conflicts[:20])
+                    + "\n\n不会自动覆盖。如需覆盖请明确说明，我再执行（overwrite=True）。"
+                )
+
+        done: list[str] = []
+        tasks: list[dict[str, Any]] = []
+        for parent, names in groups.items():
+            try:
+                data = await client.move(
+                    parent, dst, names, overwrite=bool(overwrite)
+                ) if kind == "move" else await client.copy(
+                    parent, dst, names, overwrite=bool(overwrite)
+                )
+            except OpenListAuthError:
+                raise
+            except OpenListError as exc:
+                return f"{label}失败：{exc}"
+            created = data.get("tasks") if isinstance(data, dict) else None
+            if isinstance(created, list):
+                tasks.extend(t for t in created if isinstance(t, dict))
+            else:
+                done.extend(names)
+
+        if event is not None and tasks:
+            self._track(tasks, event.unified_msg_origin, kind)
+
+        lines: list[str] = []
+        if done:
+            lines.append(f"已{label} {len(done)} 项到 {dst}。")
+        if tasks:
+            lines.append(
+                f"已创建 {len(tasks)} 个{label}任务（跨存储或大文件会后台执行）："
+            )
+            for task in tasks:
+                lines.append(_fmt_task_line(task))
+            lines.append("完成后我会主动通知你。")
+        if not lines:
+            lines.append(f"{label}请求已提交（服务端未返回详情）。")
+        return "\n".join(lines)
+
+    async def _rename(
+        self,
+        path: str,
+        new_name: str,
+        overwrite: Any = False,
+        confirm: Any = False,
+    ) -> str:
+        src = _norm_path(path)
+        name = str(new_name or "").strip().strip("/")
+        if not src or src == "/":
+            return "需要提供要重命名的完整路径。"
+        if not name:
+            return "需要提供新名字。"
+        if "/" in name or "\\" in name:
+            return "新名字里不能包含路径分隔符；要换目录请用移动。"
+        if _is_storage_root(src):
+            return f"{src} 是存储挂载点，不能重命名。"
+        parent, old_name = _split_path(src)
+        if not old_name:
+            return f"无法解析路径：{src}"
+        if old_name == name and not overwrite:
+            return "新名字和原名相同。"
+
+        client, hint = await self._client_or_hint()
+        if client is None:
+            return hint
+        target = posixpath.join(parent, name) if parent != "/" else "/" + name
+        try:
+            exists = await client.stat(target)
+        except OpenListError as exc:
+            return f"检查目标失败：{exc}"
+        if exists is not None and not overwrite:
+            return f"{target} 已存在。如需覆盖，请明确说明并允许覆盖。"
+
+        if self._needs_confirm(bool(overwrite), confirm):
+            return self._preview(
+                "将要重命名（会覆盖同名文件）：",
+                [f"{src}  →  {target}"],
+            )
+        try:
+            await client.rename(src, name, overwrite=bool(overwrite))
+        except OpenListError as exc:
+            return f"重命名失败：{exc}"
+        return f"已重命名：{src} → {target}"
+
+    async def _remove(self, paths: list[str], confirm: Any = False) -> str:
+        targets = [_norm_path(p) for p in (paths or []) if str(p or "").strip()]
+        if not targets:
+            return "需要提供要删除的路径。"
+        if len(targets) > 50:
+            return "单次最多删除 50 项。"
+        for target in targets:
+            if target == "/":
+                return "不能删除根目录。"
+            if _is_storage_root(target):
+                return f"{target} 是存储挂载点，不能删除。"
+
+        client, hint = await self._client_or_hint()
+        if client is None:
+            return hint
+
+        # 先确认存在，并统计目录内容，方便用户判断影响面。
+        detail: list[str] = []
+        for target in targets:
+            try:
+                info = await client.stat(target)
+            except OpenListError as exc:
+                return f"检查 {target} 失败：{exc}"
+            if info is None:
+                return f"不存在：{target}"
+            if info.get("is_dir"):
+                try:
+                    sub = await client.list_dir(target, per_page=200, refresh=True)
+                except OpenListError:
+                    sub = {"content": [], "total": 0}
+                count = sub.get("total") or len(sub.get("content") or [])
+                detail.append(f"{target}/（目录，内含 {count} 项，会一并删除）")
+            else:
+                detail.append(f"{target}（{_human_size(info.get('size'))}）")
+
+        if self._needs_confirm(True, confirm):
+            return self._preview(
+                f"将要删除 {len(targets)} 项（不可恢复）：", detail
+            )
+
+        groups: dict[str, list[str]] = {}
+        for target in targets:
+            parent, name = _split_path(target)
+            groups.setdefault(parent, []).append(name)
+        for parent, names in groups.items():
+            try:
+                await client.remove(parent, names)
+            except OpenListError as exc:
+                return f"删除失败（{parent}）：{exc}"
+        return "已删除：\n" + "\n".join(f"· {item}" for item in detail)
+
+    @filter.llm_tool(name="openlist_file_ops")
+    async def tool_file_ops(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        paths: list | None = None,
+        dst_dir: str = "",
+        new_name: str = "",
+        overwrite: bool = False,
+        confirm: bool = False,
+    ) -> str:
+        """OpenList 网盘（远程存储）的文件管理：列出/移动/复制/删除/重命名/新建目录。
+
+        只要用户说的是 OpenList / 网盘 / 网盘挂载里的路径（例如 /115/...、/teldrive/...、
+        /infinicloud/...、/strm/...），想看目录里有什么、把文件挪到别的目录、复制一份、
+        删掉文件、改名字、新建文件夹，都必须用这个工具，不要用 shell / 本地文件工具——
+        那些路径在服务器本地并不存在。
+        删除与移动默认先返回待确认清单（不执行），你应当把清单转述给用户，
+        得到用户明确同意后再带 confirm=True 重新调用一次。
+
+        Args:
+            action(string): list 列表，move 移动，copy 复制，remove 删除，rename 重命名，mkdir 新建目录
+            paths(list[string]): 要操作的路径列表；action=list 时可传多个目录；action=rename 时只需一个路径
+            dst_dir(string): 目标目录（move/copy 必填；rename 可填新名字所在目录，一般留空）
+            new_name(string): 新名字（仅 action=rename 时需要，不能包含路径分隔符）
+            overwrite(bool): 是否覆盖同名文件，默认 false
+            confirm(bool): 用户已确认为危险操作时传 true，默认 false
+        """
+        action = (action or "").strip().lower()
+        items = [str(p) for p in (paths or []) if str(p or "").strip()]
+        if action in ("move", "copy", "remove", "rename", "mkdir"):
+            if self._perm_denied(event):
+                return "只有管理员可以修改 OpenList 上的文件。"
+        if action in ("list", "ls", ""):
+            targets = items or ["/"]
+            if len(targets) == 1:
+                return await self._list_files(targets[0])
+            chunks = []
+            for target in targets[:5]:
+                chunks.append(await self._list_files(target))
+            if len(targets) > 5:
+                chunks.append(f"……仅列出前 5 个路径，共 {len(targets)} 个")
+            return "\n\n".join(chunks)
+        if action == "mkdir":
+            if not items:
+                return "需要提供要新建的目录路径。"
+            client, hint = await self._client_or_hint()
+            if client is None:
+                return hint
+            target = _norm_path(items[0])
+            try:
+                await client.mkdir(target)
+            except OpenListError as exc:
+                return f"新建目录失败：{exc}"
+            return f"已新建目录：{target}"
+        if action in ("move", "mv"):
+            return await self._transfer(
+                "move", items, dst_dir, overwrite, confirm, event
+            )
+        if action in ("copy", "cp"):
+            return await self._transfer(
+                "copy", items, dst_dir, overwrite, confirm, event
+            )
+        if action == "remove":
+            return await self._remove(items, confirm)
+        if action == "rename":
+            if not items:
+                return "需要提供要重命名的路径。"
+            src = items[0]
+            name = (new_name or "").strip()
+            if not name and dst_dir:
+                # 允许模型把新名字写进 dst_dir，容错一点。
+                name = dst_dir.strip().strip("/")
+            return await self._rename(src, name, overwrite, confirm)
+        return "action 只能是 list / move / copy / remove / rename / mkdir。"
 
     # ------------------------------------------------------------ LLM tools
     @filter.llm_tool(name="openlist_offline_download")
@@ -652,7 +1078,7 @@ class OpenListOfflineDownload(Star):
             urls = self._split_urls(rest)
             return event.plain_result(await self._submit(urls, event))
 
-        if sub in ("tasks", "task", "ls"):
+        if sub in ("tasks", "task"):
             return event.plain_result(
                 await self.tool_list_tasks(event, "undone")  # type: ignore[arg-type]
             )
@@ -666,6 +1092,66 @@ class OpenListOfflineDownload(Star):
             return event.plain_result(
                 await self.tool_task_detail(event, rest)  # type: ignore[arg-type]
             )
+
+        if sub in ("ls", "dir", "list"):
+            target = ""
+            if rest:
+                try:
+                    target = shlex.split(rest)[0]
+                except ValueError:
+                    target = rest
+            return event.plain_result(await self._list_files(target))
+
+        if sub in ("mkdir", "md"):
+            if self._perm_denied(event):
+                return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
+            return event.plain_result(
+                await self.tool_file_ops(  # type: ignore[arg-type]
+                    event, "mkdir", [rest]
+                )
+            )
+
+        if sub in ("mv", "move", "cp", "copy"):
+            if self._perm_denied(event):
+                return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
+            try:
+                args = shlex.split(rest)
+            except ValueError:
+                args = rest.split()
+            if len(args) < 2:
+                return event.plain_result(
+                    f"用法：/ol {sub} <源路径...> <目标目录>"
+                )
+            return event.plain_result(
+                await self._transfer(
+                    "move" if sub in ("mv", "move") else "copy",
+                    args[:-1],
+                    args[-1],
+                    False,
+                    True,
+                    event,
+                )
+            )
+
+        if sub in ("rm", "del", "remove"):
+            if self._perm_denied(event):
+                return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
+            try:
+                args = shlex.split(rest)
+            except ValueError:
+                args = rest.split()
+            return event.plain_result(await self._remove(args, True))
+
+        if sub in ("rn", "rename"):
+            if self._perm_denied(event):
+                return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
+            try:
+                args = shlex.split(rest)
+            except ValueError:
+                args = rest.split()
+            if len(args) < 2:
+                return event.plain_result("用法：/ol rn <路径> <新名字>")
+            return event.plain_result(await self._rename(args[0], " ".join(args[1:])))
 
         if sub in ("cancel", "retry", "delete", "clear"):
             if self._perm_denied(event):
