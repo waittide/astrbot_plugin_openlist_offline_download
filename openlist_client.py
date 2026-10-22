@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -114,6 +115,27 @@ def describe_state(state: Any) -> str:
     except (TypeError, ValueError):
         return str(state)
     return TASK_STATE_TEXT.get(code, f"未知状态({code})")
+
+
+def parse_sign_expire(sign: str) -> int | None:
+    """从 OpenList 的 sign 里取出过期时间戳。
+
+    sign 的格式是 ``base64url(hmac):expire``（pkg/sign/hmac.go），``expire`` 为 0
+    表示长期有效。拿不到就是 None（未知）。
+    """
+    text = str(sign or "").strip().rstrip("/")
+    if not text or ":" not in text:
+        return None
+    try:
+        return int(text.rsplit(":", 1)[1])
+    except ValueError:
+        return None
+
+
+def encode_path(path: str) -> str:
+    """按 OpenList 的方式对路径分片做 URL 编码（拼接 /d 直链用）。"""
+    segments = str(path or "/").split("/")
+    return "/".join(quote(seg, safe="") for seg in segments)
 
 
 class OpenListClient:
@@ -349,6 +371,70 @@ class OpenListClient:
                 return None
             raise
         return data if isinstance(data, dict) else None
+
+    async def file_link(self, path: str) -> dict[str, Any] | None:
+        """取单个文件的下载直链与有效期。
+
+        返回在 ``/fs/get`` 结果上补充了这些字段的字典：
+        - ``url``：可直接访问的下载地址（有签名时用 ``/d<path>?sign=...``，否则用服务端 raw_url）
+        - ``expire_ts``：链接过期时间戳（0 表示长期有效，None 表示未知）
+        - ``source``：``sign`` 签名直链，``raw`` 存储驱动给的原始直链，``unsigned`` 无签名 /d 直链
+        目录不会返回链接（OpenList 没有目录直链），``url`` 为空串。
+        """
+        info = await self.stat(path)
+        if info is None:
+            return None
+        result = dict(info)
+        result["path"] = path
+        if info.get("is_dir"):
+            result["url"] = ""
+            result["expire_ts"] = None
+            result["source"] = "dir"
+            return result
+        sign = str(info.get("sign") or "").strip()
+        raw_url = str(info.get("raw_url") or "").strip()
+        if sign:
+            result["url"] = f"{self.base_url}/d{encode_path(path)}?sign={sign}"
+            result["expire_ts"] = parse_sign_expire(sign)
+            result["source"] = "sign"
+        elif raw_url:
+            # 没有签名时服务端给的 raw_url 本身就是可下载地址（由网盘签发）。
+            result["url"] = raw_url
+            result["expire_ts"] = None
+            result["source"] = "raw"
+        else:
+            result["url"] = f"{self.base_url}/d{encode_path(path)}"
+            result["expire_ts"] = None
+            result["source"] = "unsigned"
+        return result
+
+    async def list_dir_all(
+        self,
+        path: str = "/",
+        *,
+        per_page: int = 200,
+        max_pages: int = 5,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """翻页列出目录下的全部条目（最多 max_pages 页，避免巨目录拖垮性能）。"""
+        items: list[dict[str, Any]] = []
+        for page in range(1, max(1, int(max_pages or 1)) + 1):
+            data = await self.list_dir(
+                path,
+                page=page,
+                per_page=max(1, int(per_page or 200)),
+                refresh=bool(refresh) and page == 1,
+            )
+            content = data.get("content") or []
+            items.extend(content)
+            total = data.get("total")
+            try:
+                total_num = int(total) if total is not None else len(items)
+            except (TypeError, ValueError):
+                total_num = len(items)
+            if len(content) < per_page or len(items) >= total_num:
+                break
+        return items
 
     async def mkdir(self, path: str) -> None:
         await self.request("POST", "/fs/mkdir", json_body={"path": path})

@@ -13,10 +13,12 @@ import asyncio
 import json
 import os
 import posixpath
+import re
 import shlex
 import time
 from datetime import datetime
 from typing import Any
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -69,6 +71,7 @@ HELP_TEXT = """OpenList 离线下载与文件管理
 /ol rn <路径> <新名字>            重命名
 
 /ol status          检查 OpenList 连接与配置
+/ol link <路径>     获取文件直链及有效期（任务完成通知里也会附带）
 
 路径带空格请用引号括起来，例如：
 /ol cp "/115/临时/我的 文件.mkv" /115/整理
@@ -186,6 +189,120 @@ def _fmt_task_block(task: dict[str, Any]) -> str:
         lines.append(f"错误：{task.get('error')}")
     lines.append(f"id：{task.get('id')}")
     return "\n".join(lines)
+
+
+def _link_validity(expire_ts: Any, source: str = "sign") -> str:
+    """把直链的有效期翻译成一句人能读的话。"""
+    if source == "raw":
+        return "有效期：由网盘存储驱动决定（该直链由网盘签发，通常是临时链接）"
+    if source == "unsigned":
+        return "有效期：无签名直链（OpenList 未开启链接签名，长期可用）"
+    try:
+        stamp = int(expire_ts)
+    except (TypeError, ValueError):
+        return "有效期：由服务端决定（OpenList 未给出链接过期时间）"
+    if stamp <= 0:
+        return "有效期：长期有效（OpenList 未给直链设置过期时间）"
+    deadline = datetime.fromtimestamp(stamp)
+    remain = int(stamp - time.time())
+    if remain <= 0:
+        return f"有效期：已于 {deadline.strftime('%Y-%m-%d %H:%M:%S')} 过期，需要重新取链接"
+    if remain < 60:
+        left = f"剩 {remain} 秒"
+    elif remain < 3600:
+        left = f"剩 {remain // 60} 分钟"
+    elif remain < 86400:
+        left = f"剩 {remain // 3600} 小时{remain % 3600 // 60}分"
+    else:
+        left = f"剩 {remain // 86400} 天{remain % 86400 // 3600}小时"
+    return f"有效期：至 {deadline.strftime('%Y-%m-%d %H:%M:%S')}（{left}）"
+
+
+def _fmt_link_block(
+    info: dict[str, Any], label: str = "直链"
+) -> list[str]:
+    """把 file_link() 的结果拼成“直链 + 有效期”的几行文本。"""
+    url = str(info.get("url") or "")
+    if not url:
+        return []
+    source = str(info.get("source") or "sign")
+    return [
+        f"{label}：{url}",
+        _link_validity(info.get("expire_ts"), source),
+    ]
+
+
+def _item_ts(item: dict[str, Any]) -> float:
+    """目录项的修改时间戳；拿不到就是 0。"""
+    raw = item.get("modified")
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _url_name_hint(url: Any) -> str:
+    """从提交的链接里猜出下载后的名字，用于在目录里定位新文件。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if low.startswith("magnet:"):
+        query = text.split("?", 1)[1] if "?" in text else ""
+        for pair in query.split("&"):
+            if pair.lower().startswith("dn="):
+                return unquote_plus(pair[3:]).strip()
+        return ""
+    if low.startswith("ed2k://"):
+        parts = text.split("|")
+        return parts[2].strip() if len(parts) > 2 else ""
+    if low.startswith(("http://", "https://", "ftp://")):
+        path = urlsplit(text).path
+        name = unquote(posixpath.basename(path.rstrip("/")))
+        return name.strip()
+    return ""
+
+
+def _stem(name: str) -> str:
+    return posixpath.splitext(name)[0].lower()
+
+
+def _squash(name: str) -> str:
+    """去掉标点/空格并统一大小写，用于宽容匹配与种子名字对齐。"""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", name.lower())
+
+
+def _name_matches(item_name: str, hint: str) -> bool:
+    if not hint:
+        return False
+    left, right = item_name.lower(), hint.lower()
+    if left == right or _stem(left) == _stem(right):
+        return True
+    a, b = _squash(left), _squash(right)
+    if not a or not b:
+        return False
+    # Some.Movie.2024.1080p 与 Some Movie 2024 这类命名差异也算命中。
+    return a.startswith(b) or b.startswith(a) or a in b or b in a
+
+
+def _pick_outputs(
+    items: list[dict[str, Any]], since: float, hint: str, limit: int = 5
+) -> list[dict[str, Any]]:
+    """从目录条目里挑出本次任务产出的文件/文件夹。
+
+    优先按链接里猜出的名字匹配；否则取提交之后才出现的条目（按修改时间倒序）。
+    """
+    if not items:
+        return []
+    if hint:
+        matched = [i for i in items if _name_matches(str(i.get("name") or ""), hint)]
+        if matched:
+            return matched[:limit]
+    fresh = [i for i in items if _item_ts(i) and _item_ts(i) >= since]
+    fresh.sort(key=_item_ts, reverse=True)
+    return fresh[:limit]
 
 
 @register(
@@ -380,21 +497,25 @@ class OpenListOfflineDownload(Star):
         tasks: list[dict[str, Any]],
         session: str,
         kind: str = "offline_download",
+        extras: list[dict[str, Any]] | None = None,
     ) -> None:
         if not self._notify_enabled() or not session:
             return
         now = time.time()
-        for task in tasks:
+        for index, task in enumerate(tasks):
             task_id = task.get("id")
             if not task_id:
                 continue
-            self._tracked[str(task_id)] = {
+            meta: dict[str, Any] = {
                 "session": session,
                 "name": task.get("name") or str(task_id),
                 "created_at": now,
                 "last_state": task.get("state"),
                 "kind": kind,
             }
+            if extras and index < len(extras) and isinstance(extras[index], dict):
+                meta.update({k: v for k, v in extras[index].items() if v})
+            self._tracked[str(task_id)] = meta
         self._save_tracked()
 
     def _ensure_watcher(self) -> None:
@@ -464,6 +585,82 @@ class OpenListOfflineDownload(Star):
             if finished:
                 self._save_tracked()
 
+    async def _finished_links(
+        self, save_path: str, task_name: str, meta: dict[str, Any]
+    ) -> list[str]:
+        """任务完成后取产物文件的直链 + 有效期。"""
+        client, _hint = await self._client_or_hint()
+        if client is None:
+            return []
+        root = _norm_path(save_path or "/")
+        since = float(meta.get("submitted_at") or meta.get("created_at") or 0)
+        hint = _url_name_hint(meta.get("url")) or str(task_name or "")
+        try:
+            items = await client.list_dir_all(
+                root, per_page=200, max_pages=2, refresh=True
+            )
+        except OpenListAPIError as exc:
+            # 无刷新权限的账号退回普通列表。
+            if exc.code == 403 or "Refresh" in str(exc):
+                try:
+                    items = await client.list_dir_all(root, per_page=200, max_pages=2)
+                except OpenListError as inner:
+                    logger.debug(f"[openlist] 读取下载目录失败：{inner}")
+                    return []
+            else:
+                logger.debug(f"[openlist] 读取下载目录失败：{exc}")
+                return []
+        except OpenListError as exc:
+            logger.debug(f"[openlist] 读取下载目录失败：{exc}")
+            return []
+        picked = _pick_outputs(items, since, hint)
+        lines: list[str] = []
+        file_count = 0
+        for item in picked:
+            item_name = str(item.get("name") or "")
+            item_path = posixpath.join(root, item_name)
+            if item.get("is_dir"):
+                try:
+                    children = await client.list_dir_all(
+                        item_path, per_page=200, max_pages=1
+                    )
+                except OpenListError:
+                    children = []
+                inner: list[str] = []
+                for child in [c for c in children if not c.get("is_dir")][:3]:
+                    info = await self._safe_link(
+                        client, posixpath.join(item_path, str(child.get("name") or ""))
+                    )
+                    if not info:
+                        continue
+                    inner.append(f"文件：{info.get('name') or child.get('name')}")
+                    inner.extend(_fmt_link_block(info))
+                    file_count += 1
+                if inner:
+                    lines.append(f"目录：{item_path}")
+                    lines.extend(inner)
+            else:
+                info = await self._safe_link(client, item_path)
+                if info:
+                    lines.extend(_fmt_link_block(info))
+                    file_count += 1
+            if file_count >= 3:
+                break
+        if file_count == 0:
+            return []
+        if file_count >= 3:
+            lines.append("（只列出前 3 个文件的直链，其余可用 /ol link <路径> 获取）")
+        return lines
+
+    async def _safe_link(
+        self, client: OpenListClient, path: str
+    ) -> dict[str, Any] | None:
+        try:
+            return await client.file_link(path)
+        except OpenListError as exc:
+            logger.debug(f"[openlist] 取直链失败 {path}：{exc}")
+            return None
+
     async def _push_finished(self, task: dict[str, Any], meta: dict[str, Any]) -> None:
         session = str(meta.get("session") or "")
         if not session:
@@ -483,7 +680,13 @@ class OpenListOfflineDownload(Star):
                 f"耗时：{_human_duration(task)}"
             )
             if kind == "offline_download":
-                text += f"\n保存路径：{self._download_path()}"
+                save_path = str(meta.get("path") or self._download_path())
+                text += f"\n保存路径：{save_path}"
+                links = await self._finished_links(save_path, name, meta)
+                if links:
+                    text += "\n" + "\n".join(links)
+                else:
+                    text += "\n直链：暂时读不到下载结果，可用 /ol link <路径> 手动取链接。"
         else:
             reason = str(task.get("error") or task.get("status") or "").strip()
             text = (
@@ -560,7 +763,14 @@ class OpenListOfflineDownload(Star):
             return f"提交离线下载失败：{exc}"
 
         if event is not None:
-            self._track(tasks, event.unified_msg_origin)
+            self._track(
+                tasks,
+                event.unified_msg_origin,
+                extras=[
+                    {"path": path, "url": url, "tool": tool, "submitted_at": time.time()}
+                    for url in urls
+                ],
+            )
 
         lines = [f"已提交 {len(urls)} 个链接到 {path}（方式：{tool}）"]
         if skipped:
@@ -571,6 +781,47 @@ class OpenListOfflineDownload(Star):
             lines.append("完成后我会主动通知你。")
         else:
             lines.append("服务端未返回任务信息，请用 /ol tasks 查看进度。")
+        return "\n".join(lines)
+
+    async def _file_link_text(self, path: str) -> str:
+        """取单个文件（或目录内文件）的直链与有效期。"""
+        client, hint = await self._client_or_hint()
+        if client is None:
+            return hint
+        target = _norm_path(path or "")
+        if not target or target == "/":
+            return "用法：/ol link <文件路径>"
+        link = await self._safe_link(client, target)
+        if link is None:
+            return f"路径 {target} 不存在或读取失败。"
+        if link.get("is_dir"):
+            try:
+                items = await client.list_dir_all(target, per_page=200, max_pages=1)
+            except OpenListError as exc:
+                return f"列出目录失败：{exc}"
+            files = [i for i in items if not i.get("is_dir")]
+            if not files:
+                return f"目录 {target} 里没有文件（OpenList 不提供目录直链）。"
+            lines = [f"目录：{target}（以下为前 3 个文件的直链）"]
+            count = 0
+            for item in files[:3]:
+                info = await self._safe_link(
+                    client, posixpath.join(target, str(item.get("name") or ""))
+                )
+                if not info:
+                    continue
+                lines.append(f"文件：{info.get('name') or item.get('name')}")
+                lines.extend(_fmt_link_block(info))
+                count += 1
+            if count == 0:
+                return f"目录 {target} 下的文件都取不到直链。"
+            return "\n".join(lines)
+        lines = [
+            f"路径：{target}",
+            f"大小：{_human_size(link.get('size'))}",
+            f"修改时间：{_human_time(link.get('modified'))}",
+        ]
+        lines.extend(_fmt_link_block(link))
         return "\n".join(lines)
 
     # -------------------------------------------------------------- 文件管理
@@ -589,8 +840,9 @@ class OpenListOfflineDownload(Star):
                 f"大小：{_human_size(info.get('size'))}",
                 f"修改时间：{_human_time(info.get('modified'))}",
             ]
-            if info.get("sign") or info.get("raw_url"):
-                lines.append(f"直链：{info.get('sign') or info.get('raw_url')}")
+            link = await self._safe_link(client, target)
+            if link:
+                lines.extend(_fmt_link_block(link))
             return "\n".join(lines)
         try:
             data = await client.list_dir(target, per_page=200, refresh=True)
@@ -867,9 +1119,10 @@ class OpenListOfflineDownload(Star):
         那些路径在服务器本地并不存在。
         删除与移动默认先返回待确认清单（不执行），你应当把清单转述给用户，
         得到用户明确同意后再带 confirm=True 重新调用一次。
+        用户想要直接下载/播放某个文件的直链（含有效期）时，用 action=link。
 
         Args:
-            action(string): list 列表，move 移动，copy 复制，remove 删除，rename 重命名，mkdir 新建目录
+            action(string): list 列表，link 取直链与有效期，move 移动，copy 复制，remove 删除，rename 重命名，mkdir 新建目录
             paths(list[string]): 要操作的路径列表；action=list 时可传多个目录；action=rename 时只需一个路径
             dst_dir(string): 目标目录（move/copy 必填；rename 可填新名字所在目录，一般留空）
             new_name(string): 新名字（仅 action=rename 时需要，不能包含路径分隔符）
@@ -890,6 +1143,11 @@ class OpenListOfflineDownload(Star):
                 chunks.append(await self._list_files(target))
             if len(targets) > 5:
                 chunks.append(f"……仅列出前 5 个路径，共 {len(targets)} 个")
+            return "\n\n".join(chunks)
+        if action in ("link", "url", "direct"):
+            if not items:
+                return "需要提供要取直链的文件路径。"
+            chunks = [await self._file_link_text(target) for target in items[:5]]
             return "\n\n".join(chunks)
         if action == "mkdir":
             if not items:
@@ -922,7 +1180,7 @@ class OpenListOfflineDownload(Star):
                 # 允许模型把新名字写进 dst_dir，容错一点。
                 name = dst_dir.strip().strip("/")
             return await self._rename(src, name, overwrite, confirm)
-        return "action 只能是 list / move / copy / remove / rename / mkdir。"
+        return "action 只能是 list / link / move / copy / remove / rename / mkdir。"
 
     # ------------------------------------------------------------ LLM tools
     @filter.llm_tool(name="openlist_offline_download")
@@ -1128,8 +1386,11 @@ class OpenListOfflineDownload(Star):
                     target = rest
             return event.plain_result(await self._list_files(target))
 
+        if sub in ("link", "url", "dl-link"):
+            return event.plain_result(await self._file_link_text(rest))
+
         if sub in ("mkdir", "md"):
-            if self._perm_denied(event):
+            if self._perm_denied(event, "file"):
                 return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
             return event.plain_result(
                 await self.tool_file_ops(  # type: ignore[arg-type]
