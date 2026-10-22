@@ -1,6 +1,6 @@
 name: astrbot_plugin_openlist_offline_download
 display_name: OpenList 离线下载与文件管理
 desc: 用 OpenList 的离线下载接口下载 http/https、BT 磁力链、ed2k 等链接，并管理网盘文件（列表/移动/复制/删除/重命名）；支持自然语言、进度查询与完成推送。
-version: v1.0.0
+version: v1.1.0
 author: waittide
 repo: https://github.com/waittide/astrbot_plugin_openlist_offline_download
