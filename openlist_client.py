@@ -40,6 +40,43 @@ DELETE_POLICIES = (
     "upload_download_stream",
 )
 
+# OpenList 内置的离线下载工具名（internal/offline_download/*，即 IsReady() 为 true 的那些）。
+# 顺序影响 /ol status 里的展示，不影响提交。
+OFFLINE_TOOL_NAMES: tuple[str, ...] = (
+    "115 Open",
+    "115 Cloud",
+    "123 Open",
+    "123Pan",
+    "PikPak",
+    "Thunder",
+    "ThunderX",
+    "ThunderBrowser",
+    "GuangYaPan",
+    "aria2",
+    "qBittorrent",
+    "Transmission",
+)
+
+# 本插件不支持的离线下载方式：
+# SimpleHttp 是把 http(s) 链接下载到 OpenList 本机临时目录再上传，速度与稳定性都取决于
+# OpenList 服务器自身，而且只认 http(s) 直链，所以插件里一律不提供、也不会自动选到它。
+UNSUPPORTED_OFFLINE_TOOLS: frozenset[str] = frozenset({"SimpleHttp"})
+
+# 「自动选择」在下拉框里的取值（写入配置后按空值处理）。
+OFFLINE_TOOL_AUTO = "auto"
+
+
+def filter_offline_tools(names: Any) -> list[str]:
+    """过滤掉插件不支持的离线下载方式，保持服务端返回的顺序。"""
+    if not isinstance(names, (list, tuple)):
+        return []
+    return [
+        str(item)
+        for item in names
+        if str(item).strip() and str(item) not in UNSUPPORTED_OFFLINE_TOOLS
+    ]
+
+
 # 需要跟踪/查询的任务类别（server/handles/task.go SetupTaskRoute）
 TASK_KINDS = {
     "offline_download": "离线下载",
@@ -397,7 +434,7 @@ class OpenListClient:
         )
         if not isinstance(data, list):
             return []
-        return [str(item) for item in data]
+        return filter_offline_tools(data)
 
     async def add_offline_download(
         self,

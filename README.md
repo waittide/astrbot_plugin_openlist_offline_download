@@ -29,14 +29,15 @@
 | `connection.verify_tls` | 自签证书时关闭 |
 | `connection.timeout` | 单次请求超时（秒） |
 | `download.download_path` | 离线下载保存路径，如 `/115/离线下载`。必须是 OpenList 里真实存在的目录 |
-| `download.download_tool` | 离线下载方式，如 `115 Open`、`SimpleHttp`、`aria2`、`qBittorrent`。留空则由插件自动选择该路径可用的第一个 |
+| `download.download_tool` | 离线下载方式，**下拉框选择**：`auto`（自动选择该路径可用的第一个）/ `115 Open` / `115 Cloud` / `123 Open` / `123Pan` / `GuangYaPan` / `PikPak` / `Thunder` / `ThunderX` / `ThunderBrowser` / `aria2` / `qBittorrent` / `Transmission`。`SimpleHttp`（先下到 OpenList 本机再上传）不在支持范围内，不会出现在下拉框里，也不会被自动选中 |
 | `download.delete_policy` | 临时文件清理策略：`delete_on_upload_succeed` / `delete_on_upload_failed` / `delete_never` / `delete_always` / `upload_download_stream` |
 | `download.max_urls` | 单次最多提交链接数 |
 | `notify.enabled` | 任务结束后是否主动推送结果 |
 | `notify.interval` | 后台轮询间隔（秒） |
 | `notify.expire_hours` | 单个任务最长跟踪时长（小时），超时后停止推送 |
-| `advanced.admin_only` | 仅管理员可提交/取消离线下载任务、修改 OpenList 文件 |
+| `download.admin_only` | 仅管理员可提交离线下载任务（含取消/重试/删除任务记录）。与「仅管理员可修改文件」是两个独立开关 |
 | `advanced.confirm_destructive` | 文件操作二次确认：删除/移动/重命名（覆盖）前先返回清单等待确认 |
+| `advanced.admin_only_file_ops` | 仅管理员可修改 OpenList 文件（新建目录/移动/复制/重命名/删除）。与「仅管理员可提交下载任务」分开控制 |
 
 > 访问密钥在 OpenList 里以 `Authorization: <token>` 形式使用，**不加 `Bearer` 前缀**。
 

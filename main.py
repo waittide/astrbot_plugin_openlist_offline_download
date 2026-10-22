@@ -26,7 +26,9 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .openlist_client import (
     DELETE_POLICIES,
     FINAL_TASK_STATES,
+    OFFLINE_TOOL_AUTO,
     TASK_KINDS,
+    UNSUPPORTED_OFFLINE_TOOLS,
     OpenListAPIError,
     OpenListAuthError,
     OpenListClient,
@@ -249,7 +251,15 @@ class OpenListOfflineDownload(Star):
         return raw.rstrip("/") or "/"
 
     def _download_tool(self) -> str:
-        return str(self._cfg("download.download_tool", "") or "").strip()
+        """配置里的离线下载方式；空值 / auto 都表示自动选择。"""
+        tool = str(self._cfg("download.download_tool", "") or "").strip()
+        if not tool or tool.lower() == OFFLINE_TOOL_AUTO:
+            return ""
+        if tool in UNSUPPORTED_OFFLINE_TOOLS:
+            # 即使配置里被手改成不支持的方式，也不拿它去提交。
+            logger.warning(f"[openlist] 忽略了不支持的下载方式：{tool}")
+            return ""
+        return tool
 
     def _delete_policy(self) -> str:
         policy = str(self._cfg("download.delete_policy", "") or "").strip()
@@ -510,17 +520,27 @@ class OpenListOfflineDownload(Star):
 
         path = self._download_path()
         tool = self._download_tool()
-        if not tool:
-            try:
-                available = await client.offline_download_tools(path)
-            except OpenListError as exc:
+        try:
+            available = await client.offline_download_tools(path)
+        except OpenListError as exc:
+            if tool:
+                available = []
+                logger.debug(f"[openlist] 读取可用下载方式失败：{exc}")
+            else:
                 return f"读取离线下载方式失败：{exc}"
+        if not tool:
             if not available:
                 return (
                     f"路径 {path} 下没有可用的离线下载方式。"
                     "请检查 OpenList 里该路径的存储是否已启用离线下载。"
                 )
             tool = available[0]
+        elif available and tool not in available:
+            return (
+                f"配置的下载方式「{tool}」在路径 {path} 下不可用。\n"
+                f"该路径可用方式：{'、'.join(available)}\n"
+                "请到 AstrBot 插件配置里重新选择「离线下载方式」。"
+            )
 
         try:
             tasks = await client.add_offline_download(

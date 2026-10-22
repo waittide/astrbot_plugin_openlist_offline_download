@@ -63,8 +63,38 @@
       "download_tool": {
         "description": "离线下载方式",
         "type": "string",
-        "default": "",
-        "hint": "留空则由插件自动选择该路径可用的第一个方式（如 115 Open / SimpleHttp / aria2 / qBittorrent）；也可以直接填写方式名称固定下来。"
+        "default": "auto",
+        "options": [
+          "auto",
+          "115 Open",
+          "115 Cloud",
+          "123 Open",
+          "123Pan",
+          "GuangYaPan",
+          "PikPak",
+          "Thunder",
+          "ThunderX",
+          "ThunderBrowser",
+          "aria2",
+          "qBittorrent",
+          "Transmission"
+        ],
+        "labels": [
+          "自动选择（该路径可用的第一个方式）",
+          "115 Open（115 开放平台）",
+          "115 Cloud（115 网盘）",
+          "123 Open（123 云盘开放平台）",
+          "123Pan（123 云盘）",
+          "GuangYaPan（光雅盘）",
+          "PikPak",
+          "Thunder（迅雷）",
+          "ThunderX（迅雷 X）",
+          "ThunderBrowser（迅雷浏览器）",
+          "aria2",
+          "qBittorrent",
+          "Transmission"
+        ],
+        "hint": "只能从下拉框选择。SimpleHttp（先下载到 OpenList 本机再上传）不在支持范围内，插件也不会自动选到它。选「自动选择」时，插件会在该路径可用的方式里取第一个（同样跳过 SimpleHttp）；若选定的方式在该路径不可用，提交时会直接报错并列出可用方式。"
       },
       "delete_policy": {
         "description": "临时文件清理策略",
