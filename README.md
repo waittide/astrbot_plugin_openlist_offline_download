@@ -85,7 +85,7 @@
 
 路径带空格请用引号括起来。危险操作（删除、移动、重命名覆盖）会先返回待确认清单，回复「确认」后 AI 才带 `confirm=True` 重新调用。
 
-指令受 `advanced.admin_only` 控制（默认仅管理员）。
+指令受 `download.admin_only` / `advanced.admin_only_file_ops` 分别控制（默认都仅管理员）。
 
 ## 实现说明
 

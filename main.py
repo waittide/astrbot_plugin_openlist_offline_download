@@ -287,8 +287,13 @@ class OpenListOfflineDownload(Star):
             hours = 24
         return hours * 3600
 
-    def _admin_only(self) -> bool:
-        return bool(self._cfg("advanced.admin_only", True))
+    def _admin_only(self, scope: str = "download") -> bool:
+        """提交下载任务与修改文件是两个独立开关，scope 区分。"""
+        if scope == "file":
+            return bool(
+                self._cfg("advanced.admin_only_file_ops", True)
+            )
+        return bool(self._cfg("download.admin_only", True))
 
     def _confirm_destructive(self) -> bool:
         return bool(self._cfg("advanced.confirm_destructive", True))
@@ -328,8 +333,9 @@ class OpenListOfflineDownload(Star):
         except OpenListError as exc:
             return None, str(exc)
 
-    def _perm_denied(self, event: AstrMessageEvent) -> bool:
-        if not self._admin_only():
+    def _perm_denied(self, event: AstrMessageEvent, scope: str = "download") -> bool:
+        """scope=download 查下载任务权限，scope=file 查文件修改权限。"""
+        if not self._admin_only(scope):
             return False
         try:
             return not event.is_admin()
@@ -873,7 +879,7 @@ class OpenListOfflineDownload(Star):
         action = (action or "").strip().lower()
         items = [str(p) for p in (paths or []) if str(p or "").strip()]
         if action in ("move", "copy", "remove", "rename", "mkdir"):
-            if self._perm_denied(event):
+            if self._perm_denied(event, "file"):
                 return "只有管理员可以修改 OpenList 上的文件。"
         if action in ("list", "ls", ""):
             targets = items or ["/"]
@@ -1132,7 +1138,7 @@ class OpenListOfflineDownload(Star):
             )
 
         if sub in ("mv", "move", "cp", "copy"):
-            if self._perm_denied(event):
+            if self._perm_denied(event, "file"):
                 return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
             try:
                 args = shlex.split(rest)
@@ -1154,7 +1160,7 @@ class OpenListOfflineDownload(Star):
             )
 
         if sub in ("rm", "del", "remove"):
-            if self._perm_denied(event):
+            if self._perm_denied(event, "file"):
                 return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
             try:
                 args = shlex.split(rest)
@@ -1163,7 +1169,7 @@ class OpenListOfflineDownload(Star):
             return event.plain_result(await self._remove(args, True))
 
         if sub in ("rn", "rename"):
-            if self._perm_denied(event):
+            if self._perm_denied(event, "file"):
                 return event.plain_result("只有管理员可以修改 OpenList 上的文件。")
             try:
                 args = shlex.split(rest)

@@ -114,6 +114,12 @@
         "type": "int",
         "default": 10,
         "slider": { "min": 1, "max": 50, "step": 1 }
+      },
+      "admin_only": {
+        "description": "仅管理员可提交下载任务",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后只有 AstrBot 管理员能提交离线下载任务、取消/重试/删除任务记录。与「仅管理员可修改文件」是分开的开关，可以分别设置。"
       }
     }
   },
@@ -146,11 +152,11 @@
     "description": "高级",
     "type": "object",
     "items": {
-      "admin_only": {
-        "description": "仅管理员可用",
+      "admin_only_file_ops": {
+        "description": "仅管理员可修改文件",
         "type": "bool",
         "default": true,
-        "hint": "开启后只有 AstrBot 管理员能提交离线下载任务、修改 OpenList 上的文件。"
+        "hint": "开启后只有 AstrBot 管理员能新建目录、移动、复制、重命名、删除 OpenList 上的文件。与「仅管理员可提交下载任务」互不影响：关掉这个，普通成员仍能自己删改文件；关掉下载那个，普通成员仍能提交下载。"
       },
       "confirm_destructive": {
         "description": "文件操作二次确认",
